@@ -112,6 +112,14 @@ class AlarmManagerService extends IAlarmManager.Stub {
     private final ResultReceiver mResultReceiver = new ResultReceiver();
     private final PendingIntent mTimeTickSender;
     private final PendingIntent mDateChangeSender;
+    ArrayList<Alarm> mPendingNonWakeupAlarms = new ArrayList<Alarm>();
+    InteractiveStateReceiver mInteractiveStateReceiver;
+    boolean mInteractive = true;
+    long mNonInteractiveStartTime;
+    long mNonInteractiveTime;
+    long mLastAlarmDeliveryTime;
+    long mStartCurrentDelayTime;
+    long mNextNonWakeupDeliveryTime;
 
     class WakeupEvent {
         public long when;
@@ -461,7 +469,11 @@ class AlarmManagerService extends IAlarmManager.Stub {
     
     private final HashMap<String, BroadcastStats> mBroadcastStats
             = new HashMap<String, BroadcastStats>();
-    
+
+    int mNumDelayedAlarms = 0;
+    long mTotalDelayTime = 0;
+    long mMaxDelayTime = 0;
+
     public AlarmManagerService(Context context) {
         mContext = context;
         mDescriptor = init();
@@ -492,7 +504,8 @@ class AlarmManagerService extends IAlarmManager.Stub {
         mClockReceiver.scheduleTimeTickEvent();
         mClockReceiver.scheduleDateChangedEvent();
         mUninstallReceiver = new UninstallReceiver();
-        
+        mInteractiveStateReceiver = new InteractiveStateReceiver();
+
         if (mDescriptor != -1) {
             mWaitThread.start();
         } else {
@@ -655,6 +668,7 @@ class AlarmManagerService extends IAlarmManager.Stub {
     private void rescheduleKernelAlarmsLocked() {
         // Schedule the next upcoming wakeup alarm.  If there is a deliverable batch
         // prior to that which contains no wakeups, we schedule that as well.
+        long nextNonWakeup = 0;
         if (mAlarmBatches.size() > 0) {
             final Batch firstWakeup = findFirstWakeupBatchLocked();
             final Batch firstBatch = mAlarmBatches.get(0);
@@ -662,10 +676,18 @@ class AlarmManagerService extends IAlarmManager.Stub {
                 mNextWakeup = firstWakeup.start;
                 setLocked(ELAPSED_REALTIME_WAKEUP, firstWakeup.start);
             }
-            if (firstBatch != firstWakeup && mNextNonWakeup != firstBatch.start) {
-                mNextNonWakeup = firstBatch.start;
-                setLocked(ELAPSED_REALTIME, firstBatch.start);
+            if (firstBatch != firstWakeup) {
+                nextNonWakeup = firstBatch.start;
             }
+        }
+        if (mPendingNonWakeupAlarms.size() > 0) {
+            if (nextNonWakeup == 0 || mNextNonWakeupDeliveryTime < nextNonWakeup) {
+                nextNonWakeup = mNextNonWakeupDeliveryTime;
+            }
+        }
+        if (nextNonWakeup != 0 && mNextNonWakeup != nextNonWakeup) {
+            mNextNonWakeup = nextNonWakeup;
+            setLocked(ELAPSED_REALTIME, nextNonWakeup);
         }
     }
 
@@ -784,6 +806,32 @@ class AlarmManagerService extends IAlarmManager.Stub {
         }
     }
 
+    void interactiveStateChangedLocked(boolean interactive) {
+        if (mInteractive != interactive) {
+            mInteractive = interactive;
+            final long nowELAPSED = SystemClock.elapsedRealtime();
+            if (interactive) {
+                if (mPendingNonWakeupAlarms.size() > 0) {
+                    final long thisDelayTime = nowELAPSED - mStartCurrentDelayTime;
+                    mTotalDelayTime += thisDelayTime;
+                    if (mMaxDelayTime < thisDelayTime) {
+                        mMaxDelayTime = thisDelayTime;
+                    }
+                    deliverAlarmsLocked(mPendingNonWakeupAlarms, nowELAPSED);
+                    mPendingNonWakeupAlarms.clear();
+                }
+                if (mNonInteractiveStartTime > 0) {
+                    long dur = nowELAPSED - mNonInteractiveStartTime;
+                    if (dur > mNonInteractiveTime) {
+                        mNonInteractiveTime = dur;
+                    }
+                }
+            } else {
+                mNonInteractiveStartTime = nowELAPSED;
+            }
+        }
+    }
+
     public boolean lookForPackageLocked(String packageName) {
         for (int i = 0; i < mAlarmBatches.size(); i++) {
             Batch b = mAlarmBatches.get(i);
@@ -840,6 +888,20 @@ class AlarmManagerService extends IAlarmManager.Stub {
             pw.print("nowRTC="); pw.print(nowRTC);
             pw.print("="); pw.print(sdf.format(new Date(nowRTC)));
             pw.print(" nowELAPSED="); pw.println(nowELAPSED);
+            if (!mInteractive) {
+                pw.print("Time since non-interactive: ");
+                TimeUtils.formatDuration(nowELAPSED - mNonInteractiveStartTime, pw);
+                pw.println();
+                pw.print("Max wakeup delay: ");
+                TimeUtils.formatDuration(currentNonWakeupFuzzLocked(nowELAPSED), pw);
+                pw.println();
+                pw.print("Time since last dispatch: ");
+                TimeUtils.formatDuration(nowELAPSED - mLastAlarmDeliveryTime, pw);
+                pw.println();
+                pw.print("Next non-wakeup delivery time: ");
+                TimeUtils.formatDuration(nowELAPSED - mNextNonWakeupDeliveryTime, pw);
+                pw.println();
+            }
 
             long nextWakeupRTC = mNextWakeup + (nowRTC - nowELAPSED);
             long nextNonWakeupRTC = mNextNonWakeup + (nowRTC - nowELAPSED);
@@ -857,6 +919,22 @@ class AlarmManagerService extends IAlarmManager.Stub {
                     dumpAlarmList(pw, b.alarms, "  ", nowELAPSED, nowRTC);
                 }
             }
+
+            pw.println();
+            pw.print("Past-due non-wakeup alarms: ");
+            if (mPendingNonWakeupAlarms.size() > 0) {
+                pw.println(mPendingNonWakeupAlarms.size());
+                dumpAlarmList(pw, mPendingNonWakeupAlarms, "  ", nowELAPSED, nowRTC);
+            } else {
+                pw.println("(none)");
+            }
+            pw.print("  Number of delayed alarms: "); pw.print(mNumDelayedAlarms);
+            pw.print(", total delay time: "); TimeUtils.formatDuration(mTotalDelayTime, pw);
+            pw.println();
+            pw.print("  Max delay time: "); TimeUtils.formatDuration(mMaxDelayTime, pw);
+            pw.print(", max non-interactive time: ");
+            TimeUtils.formatDuration(mNonInteractiveTime, pw);
+            pw.println();
 
             pw.println();
             pw.print("  Broadcast ref count: "); pw.println(mBroadcastRefCount);
@@ -1020,7 +1098,9 @@ class AlarmManagerService extends IAlarmManager.Stub {
     private native int waitForAlarm(int fd);
     private native int setKernelTimezone(int fd, int minuteswest);
 
-    private void triggerAlarmsLocked(ArrayList<Alarm> triggerList, long nowELAPSED, long nowRTC) {
+    private boolean triggerAlarmsLocked(ArrayList<Alarm> triggerList, long nowELAPSED,
+            long nowRTC) {
+        boolean hasWakeup = false;
         // batches are temporally sorted, so we need only pull from the
         // start of the list until we either empty it or hit a batch
         // that is not yet deliverable
@@ -1055,10 +1135,19 @@ class AlarmManagerService extends IAlarmManager.Stub {
                             maxTriggerTime(nowELAPSED, nextElapsed, alarm.repeatInterval),
                             alarm.repeatInterval, alarm.operation, batch.standalone, true,
                             alarm.workSource);
+
+                    // For now we count this as a wakeup alarm, meaning it needs to be
+                    // delivered immediately.  In the future we should change this, but
+                    // that required delaying when we reschedule the repeat...!
+                    hasWakeup = false;
+                } else if (alarm.wakeup) {
+                    hasWakeup = true;
                 }
 
             }
         }
+
+        return hasWakeup;
     }
 
     /**
@@ -1088,10 +1177,13 @@ class AlarmManagerService extends IAlarmManager.Stub {
         public long repeatInterval;
         public PendingIntent operation;
         public WorkSource workSource;
-        
+        public final boolean wakeup;
+
         public Alarm(int _type, long _when, long _whenElapsed, long _windowLength, long _maxWhen,
                 long _interval, PendingIntent _op, WorkSource _ws) {
             type = _type;
+            wakeup = _type == AlarmManager.ELAPSED_REALTIME_WAKEUP
+                    || _type == AlarmManager.RTC_WAKEUP;
             when = _when;
             whenElapsed = _whenElapsed;
             windowLength = _windowLength;
@@ -1145,6 +1237,93 @@ class AlarmManagerService extends IAlarmManager.Stub {
         }
     }
 
+    long currentNonWakeupFuzzLocked(long nowELAPSED) {
+        long timeSinceOn = nowELAPSED - mNonInteractiveStartTime;
+        if (timeSinceOn < 5*60*1000) {
+            // If the screen has been off for 5 minutes, only delay by at most two minutes.
+            return 2*60*1000;
+        } else if (timeSinceOn < 30*60*1000) {
+            // If the screen has been off for 30 minutes, only delay by at most 15 minutes.
+            return 15*60*1000;
+        } else {
+            // Otherwise, we will delay by at most an hour.
+            return 60*60*1000;
+        }
+    }
+
+    boolean checkAllowNonWakeupDelayLocked(long nowELAPSED) {
+        if (mInteractive) {
+            return false;
+        }
+        if (mLastAlarmDeliveryTime <= 0) {
+            return false;
+        }
+        if (mPendingNonWakeupAlarms.size() > 0 && mNextNonWakeupDeliveryTime > nowELAPSED) {
+            // This is just a little paranoia, if somehow we have pending non-wakeup alarms
+            // and the next delivery time is in the past, then just deliver them all.  This
+            // avoids bugs where we get stuck in a loop trying to poll for alarms.
+            return false;
+        }
+        long timeSinceLast = nowELAPSED - mLastAlarmDeliveryTime;
+        return timeSinceLast <= currentNonWakeupFuzzLocked(nowELAPSED);
+    }
+
+    void deliverAlarmsLocked(ArrayList<Alarm> triggerList, long nowELAPSED) {
+        mLastAlarmDeliveryTime = nowELAPSED;
+        for (int i=0; i<triggerList.size(); i++) {
+            Alarm alarm = triggerList.get(i);
+            try {
+                if (localLOGV) Slog.v(TAG, "sending alarm " + alarm);
+                alarm.operation.send(mContext, 0,
+                        mBackgroundIntent.putExtra(
+                                Intent.EXTRA_ALARM_COUNT, alarm.count),
+                        mResultReceiver, mHandler);
+
+                // we have an active broadcast so stay awake.
+                if (mBroadcastRefCount == 0) {
+                    setWakelockWorkSource(alarm.operation, alarm.workSource);
+                    mWakeLock.acquire();
+                }
+                final InFlight inflight = new InFlight(AlarmManagerService.this,
+                        alarm.operation, alarm.workSource);
+                mInFlight.add(inflight);
+                mBroadcastRefCount++;
+
+                final BroadcastStats bs = inflight.mBroadcastStats;
+                bs.count++;
+                if (bs.nesting == 0) {
+                    bs.nesting = 1;
+                    bs.startTime = nowELAPSED;
+                } else {
+                    bs.nesting++;
+                }
+                final FilterStats fs = inflight.mFilterStats;
+                fs.count++;
+                if (fs.nesting == 0) {
+                    fs.nesting = 1;
+                    fs.startTime = nowELAPSED;
+                } else {
+                    fs.nesting++;
+                }
+                if (alarm.type == ELAPSED_REALTIME_WAKEUP
+                        || alarm.type == RTC_WAKEUP) {
+                    bs.numWakeup++;
+                    fs.numWakeup++;
+                    ActivityManagerNative.noteWakeupAlarm(
+                            alarm.operation);
+                }
+            } catch (PendingIntent.CanceledException e) {
+                if (alarm.repeatInterval > 0) {
+                    // This IntentSender is no longer valid, but this
+                    // is a repeating alarm, so toss the hoser.
+                    remove(alarm.operation);
+                }
+            } catch (RuntimeException e) {
+                Slog.w(TAG, "Failure sending alarm.", e);
+            }
+        }
+    }
+
     private class AlarmThread extends Thread
     {
         public AlarmThread()
@@ -1174,7 +1353,7 @@ class AlarmManagerService extends IAlarmManager.Stub {
                             | Intent.FLAG_RECEIVER_REGISTERED_ONLY_BEFORE_BOOT);
                     mContext.sendBroadcastAsUser(intent, UserHandle.ALL);
                 }
-                
+
                 synchronized (mLock) {
                     final long nowRTC = System.currentTimeMillis();
                     final long nowELAPSED = SystemClock.elapsedRealtime();
@@ -1198,61 +1377,36 @@ class AlarmManagerService extends IAlarmManager.Stub {
                         }
                     }
 
-                    triggerAlarmsLocked(triggerList, nowELAPSED, nowRTC);
-                    rescheduleKernelAlarmsLocked();
-
-                    // now deliver the alarm intents
-                    for (int i=0; i<triggerList.size(); i++) {
-                        Alarm alarm = triggerList.get(i);
-                        try {
-                            if (localLOGV) Slog.v(TAG, "sending alarm " + alarm);
-                            alarm.operation.send(mContext, 0,
-                                    mBackgroundIntent.putExtra(
-                                            Intent.EXTRA_ALARM_COUNT, alarm.count),
-                                    mResultReceiver, mHandler);
-                            
-                            // we have an active broadcast so stay awake.
-                            if (mBroadcastRefCount == 0) {
-                                setWakelockWorkSource(alarm.operation, alarm.workSource);
-                                mWakeLock.acquire();
-                            }
-                            final InFlight inflight = new InFlight(AlarmManagerService.this,
-                                    alarm.operation, alarm.workSource);
-                            mInFlight.add(inflight);
-                            mBroadcastRefCount++;
-
-                            final BroadcastStats bs = inflight.mBroadcastStats;
-                            bs.count++;
-                            if (bs.nesting == 0) {
-                                bs.nesting = 1;
-                                bs.startTime = nowELAPSED;
-                            } else {
-                                bs.nesting++;
-                            }
-                            final FilterStats fs = inflight.mFilterStats;
-                            fs.count++;
-                            if (fs.nesting == 0) {
-                                fs.nesting = 1;
-                                fs.startTime = nowELAPSED;
-                            } else {
-                                fs.nesting++;
-                            }
-                            if (alarm.type == ELAPSED_REALTIME_WAKEUP
-                                    || alarm.type == RTC_WAKEUP) {
-                                bs.numWakeup++;
-                                fs.numWakeup++;
-                                ActivityManagerNative.noteWakeupAlarm(
-                                        alarm.operation);
-                            }
-                        } catch (PendingIntent.CanceledException e) {
-                            if (alarm.repeatInterval > 0) {
-                                // This IntentSender is no longer valid, but this
-                                // is a repeating alarm, so toss the hoser.
-                                remove(alarm.operation);
-                            }
-                        } catch (RuntimeException e) {
-                            Slog.w(TAG, "Failure sending alarm.", e);
+                    boolean hasWakeup = triggerAlarmsLocked(triggerList, nowELAPSED, nowRTC);
+                    if (!hasWakeup && checkAllowNonWakeupDelayLocked(nowELAPSED)) {
+                        // if there are no wakeup alarms and the screen is off, we can
+                        // delay what we have so far until the future.
+                        if (mPendingNonWakeupAlarms.size() == 0) {
+                            mStartCurrentDelayTime = nowELAPSED;
+                            mNextNonWakeupDeliveryTime = nowELAPSED
+                                    + ((currentNonWakeupFuzzLocked(nowELAPSED)*3)/2);
                         }
+                        mPendingNonWakeupAlarms.addAll(triggerList);
+                        mNumDelayedAlarms += triggerList.size();
+                        rescheduleKernelAlarmsLocked();
+                    } else {
+                        // now deliver the alarm intents; if there are pending non-wakeup
+                        // alarms, we need to merge them in to the list.  note we don't
+                        // just deliver them first because we generally want non-wakeup
+                        // alarms delivered after wakeup alarms.
+                        // (OpenMyGlass: 4.4 has no wakeup-first dispatch comparator, so
+                        // the delayed non-wakeup alarms are appended after this pass.)
+                        rescheduleKernelAlarmsLocked();
+                        if (mPendingNonWakeupAlarms.size() > 0) {
+                            triggerList.addAll(mPendingNonWakeupAlarms);
+                            final long thisDelayTime = nowELAPSED - mStartCurrentDelayTime;
+                            mTotalDelayTime += thisDelayTime;
+                            if (mMaxDelayTime < thisDelayTime) {
+                                mMaxDelayTime = thisDelayTime;
+                            }
+                            mPendingNonWakeupAlarms.clear();
+                        }
+                        deliverAlarmsLocked(triggerList, nowELAPSED);
                     }
                 }
             }
@@ -1300,7 +1454,7 @@ class AlarmManagerService extends IAlarmManager.Stub {
                     final long nowELAPSED = SystemClock.elapsedRealtime();
                     triggerAlarmsLocked(triggerList, nowELAPSED, nowRTC);
                 }
-                
+
                 // now trigger the alarms without the lock held
                 for (int i=0; i<triggerList.size(); i++) {
                     Alarm alarm = triggerList.get(i);
@@ -1372,6 +1526,23 @@ class AlarmManagerService extends IAlarmManager.Stub {
         }
     }
     
+    class InteractiveStateReceiver extends BroadcastReceiver {
+        public InteractiveStateReceiver() {
+            IntentFilter filter = new IntentFilter();
+            filter.addAction(Intent.ACTION_SCREEN_OFF);
+            filter.addAction(Intent.ACTION_SCREEN_ON);
+            filter.setPriority(IntentFilter.SYSTEM_HIGH_PRIORITY);
+            mContext.registerReceiver(this, filter);
+        }
+
+        @Override
+        public void onReceive(Context context, Intent intent) {
+            synchronized (mLock) {
+                interactiveStateChangedLocked(Intent.ACTION_SCREEN_ON.equals(intent.getAction()));
+            }
+        }
+    }
+
     class UninstallReceiver extends BroadcastReceiver {
         public UninstallReceiver() {
             IntentFilter filter = new IntentFilter();
