@@ -1154,12 +1154,9 @@ class AlarmManagerService extends IAlarmManager.Stub {
                             maxTriggerTime(nowELAPSED, nextElapsed, alarm.repeatInterval),
                             alarm.repeatInterval, alarm.operation, batch.standalone, true,
                             alarm.workSource);
+                }
 
-                    // For now we count this as a wakeup alarm, meaning it needs to be
-                    // delivered immediately.  In the future we should change this, but
-                    // that required delaying when we reschedule the repeat...!
-                    hasWakeup = false;
-                } else if (alarm.wakeup) {
+                if (alarm.wakeup) {
                     hasWakeup = true;
                 }
 
