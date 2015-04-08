@@ -33,6 +33,7 @@ import android.os.Bundle;
 import android.os.Handler;
 import android.os.Message;
 import android.os.PowerManager;
+import android.os.Process;
 import android.os.SystemClock;
 import android.os.SystemProperties;
 import android.os.UserHandle;
@@ -126,6 +127,14 @@ class AlarmManagerService extends IAlarmManager.Stub {
     long mLastAlarmDeliveryTime;
     long mStartCurrentDelayTime;
     long mNextNonWakeupDeliveryTime;
+
+    // Device idle (OpenMyGlass, adapted from 6.0's mPendingIdleUntil): while
+    // mDeviceIdle is true, alarms that are not allowed to run while idle are
+    // held in mPendingWhileIdleAlarms until idle ends.  The Glass idle controller
+    // sets both fields.
+    boolean mDeviceIdle;
+    int[] mDeviceIdleWhitelist = new int[0];  // sorted app ids
+    ArrayList<Alarm> mPendingWhileIdleAlarms = new ArrayList<Alarm>();
 
     class WakeupEvent {
         public long when;
@@ -397,22 +406,102 @@ class AlarmManagerService extends IAlarmManager.Stub {
             Batch batch = oldSet.get(batchNum);
             final int N = batch.size();
             for (int i = 0; i < N; i++) {
-                Alarm a = batch.get(i);
-                long whenElapsed = convertToElapsed(a.when, a.type);
-                final long maxElapsed;
-                if (a.whenElapsed == a.maxWhen) {
-                    // Exact
-                    maxElapsed = whenElapsed;
-                } else {
-                    // Not exact.  Preserve any explicit window, otherwise recalculate
-                    // the window based on the alarm's new futurity.  Note that this
-                    // reflects a policy of preferring timely to deferred delivery.
-                    maxElapsed = (a.windowLength > 0)
-                            ? (whenElapsed + a.windowLength)
-                            : maxTriggerTime(nowElapsed, whenElapsed, a.repeatInterval);
+                reAddAlarmLocked(batch.get(i), batch.standalone, nowElapsed, doValidate);
+            }
+        }
+    }
+
+    void reAddAlarmLocked(Alarm a, boolean standalone, long nowElapsed, boolean doValidate) {
+        long whenElapsed = convertToElapsed(a.when, a.type);
+        final long maxElapsed;
+        if (a.whenElapsed == a.maxWhen) {
+            // Exact
+            maxElapsed = whenElapsed;
+        } else {
+            // Not exact.  Preserve any explicit window, otherwise recalculate
+            // the window based on the alarm's new futurity.  Note that this
+            // reflects a policy of preferring timely to deferred delivery.
+            maxElapsed = (a.windowLength > 0)
+                    ? (whenElapsed + a.windowLength)
+                    : maxTriggerTime(nowElapsed, whenElapsed, a.repeatInterval);
+        }
+        setImplLocked(a.type, a.when, whenElapsed, a.windowLength, maxElapsed,
+                a.repeatInterval, a.operation, standalone, doValidate, a.workSource);
+    }
+
+    void restorePendingWhileIdleAlarmsLocked() {
+        // Bring pending alarms back into the main list.  Those that are still not
+        // allowed (we are still idle) go straight back to the pending list.
+        if (mPendingWhileIdleAlarms.size() > 0) {
+            ArrayList<Alarm> alarms = mPendingWhileIdleAlarms;
+            mPendingWhileIdleAlarms = new ArrayList<Alarm>();
+            final long nowElapsed = SystemClock.elapsedRealtime();
+            for (int i = alarms.size() - 1; i >= 0; i--) {
+                Alarm a = alarms.get(i);
+                reAddAlarmLocked(a, a.standalone, nowElapsed, false);
+            }
+        }
+
+        // Reschedule everything.
+        rescheduleKernelAlarmsLocked();
+    }
+
+    /**
+     * Whether an alarm runs while the device is idle: alarms the system sets for
+     * itself (uid below FIRST_APPLICATION_UID, no work source), as in 6.0, and
+     * alarms of whitelisted app ids.  An alarm set with a work source runs only
+     * if every uid in it is a system uid or whitelisted.
+     */
+    private boolean isAllowedWhileIdleLocked(Alarm a) {
+        if (a.workSource == null || a.workSource.size() == 0) {
+            return isExemptAppIdLocked(UserHandle.getAppId(a.operation.getCreatorUid()));
+        }
+        for (int i = 0; i < a.workSource.size(); i++) {
+            if (!isExemptAppIdLocked(UserHandle.getAppId(a.workSource.get(i)))) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private boolean isExemptAppIdLocked(int appId) {
+        return appId < Process.FIRST_APPLICATION_UID
+                || Arrays.binarySearch(mDeviceIdleWhitelist, appId) >= 0;
+    }
+
+    /** Enter or leave device idle.  For system_server's Glass idle controller. */
+    void setDeviceIdle(boolean idle) {
+        synchronized (mLock) {
+            if (mDeviceIdle == idle) {
+                return;
+            }
+            mDeviceIdle = idle;
+            if (idle) {
+                // Re-adding every alarm moves those not allowed while idle out.
+                rebatchAllAlarmsLocked(true);
+                rescheduleKernelAlarmsLocked();
+            } else {
+                restorePendingWhileIdleAlarmsLocked();
+                // And send a TIME_TICK right now, since it is important to get the UI
+                // updated.
+                try {
+                    mTimeTickSender.send();
+                } catch (PendingIntent.CanceledException e) {
                 }
-                setImplLocked(a.type, a.when, whenElapsed, a.windowLength, maxElapsed,
-                        a.repeatInterval, a.operation, batch.standalone, doValidate, a.workSource);
+            }
+        }
+    }
+
+    /** Sorted app ids whose alarms run while idle. */
+    void setDeviceIdleWhitelist(int[] appIds) {
+        synchronized (mLock) {
+            mDeviceIdleWhitelist = appIds;
+            if (mDeviceIdle) {
+                // Bring back the alarms of newly exempt apps, and hold those of apps
+                // that are no longer exempt.
+                restorePendingWhileIdleAlarmsLocked();
+                rebatchAllAlarmsLocked(true);
+                rescheduleKernelAlarmsLocked();
             }
         }
     }
@@ -607,7 +696,14 @@ class AlarmManagerService extends IAlarmManager.Stub {
             boolean doValidate, WorkSource workSource) {
         Alarm a = new Alarm(type, when, whenElapsed, windowLength, maxWhen, interval,
                 operation, workSource);
+        a.standalone = isStandalone;
         removeLocked(operation);
+
+        if (mDeviceIdle && !isAllowedWhileIdleLocked(a)) {
+            // We are idle; if this alarm may not run while idle, put it on hold.
+            mPendingWhileIdleAlarms.add(a);
+            return;
+        }
 
         int whichBatch = (isStandalone) ? -1 : attemptCoalesceLocked(whenElapsed, maxWhen);
         if (whichBatch < 0) {
@@ -777,6 +873,12 @@ class AlarmManagerService extends IAlarmManager.Stub {
                 mAlarmBatches.remove(i);
             }
         }
+        for (int i = mPendingWhileIdleAlarms.size() - 1; i >= 0; i--) {
+            if (mPendingWhileIdleAlarms.get(i).operation.equals(operation)) {
+                // Don't set didRemove, since this doesn't impact the scheduled alarms.
+                mPendingWhileIdleAlarms.remove(i);
+            }
+        }
 
         if (didRemove) {
             if (DEBUG_BATCH) {
@@ -796,6 +898,12 @@ class AlarmManagerService extends IAlarmManager.Stub {
                 mAlarmBatches.remove(i);
             }
         }
+        for (int i = mPendingWhileIdleAlarms.size() - 1; i >= 0; i--) {
+            if (mPendingWhileIdleAlarms.get(i).operation.getTargetPackage().equals(packageName)) {
+                // Don't set didRemove, since this doesn't impact the scheduled alarms.
+                mPendingWhileIdleAlarms.remove(i);
+            }
+        }
 
         if (didRemove) {
             if (DEBUG_BATCH) {
@@ -813,6 +921,13 @@ class AlarmManagerService extends IAlarmManager.Stub {
             didRemove |= b.remove(userHandle);
             if (b.size() == 0) {
                 mAlarmBatches.remove(i);
+            }
+        }
+        for (int i = mPendingWhileIdleAlarms.size() - 1; i >= 0; i--) {
+            if (UserHandle.getUserId(mPendingWhileIdleAlarms.get(i).operation.getCreatorUid())
+                    == userHandle) {
+                // Don't set didRemove, since this doesn't impact the scheduled alarms.
+                mPendingWhileIdleAlarms.remove(i);
             }
         }
 
@@ -855,6 +970,11 @@ class AlarmManagerService extends IAlarmManager.Stub {
         for (int i = 0; i < mAlarmBatches.size(); i++) {
             Batch b = mAlarmBatches.get(i);
             if (b.hasPackage(packageName)) {
+                return true;
+            }
+        }
+        for (int i = 0; i < mPendingWhileIdleAlarms.size(); i++) {
+            if (mPendingWhileIdleAlarms.get(i).operation.getTargetPackage().equals(packageName)) {
                 return true;
             }
         }
@@ -937,6 +1057,17 @@ class AlarmManagerService extends IAlarmManager.Stub {
                     pw.print(b); pw.println(':');
                     dumpAlarmList(pw, b.alarms, "  ", nowELAPSED, nowRTC);
                 }
+            }
+
+            pw.println();
+            pw.print("Device idle: "); pw.print(mDeviceIdle);
+            pw.print(", whitelist (app ids): "); pw.println(Arrays.toString(mDeviceIdleWhitelist));
+            pw.print("Pending alarms while idle: ");
+            if (mPendingWhileIdleAlarms.size() > 0) {
+                pw.println(mPendingWhileIdleAlarms.size());
+                dumpAlarmList(pw, mPendingWhileIdleAlarms, "  ", nowELAPSED, nowRTC);
+            } else {
+                pw.println("(none)");
             }
 
             pw.println();
@@ -1194,6 +1325,7 @@ class AlarmManagerService extends IAlarmManager.Stub {
         public PendingIntent operation;
         public WorkSource workSource;
         public final boolean wakeup;
+        public boolean standalone;
 
         public Alarm(int _type, long _when, long _whenElapsed, long _windowLength, long _maxWhen,
                 long _interval, PendingIntent _op, WorkSource _ws) {
