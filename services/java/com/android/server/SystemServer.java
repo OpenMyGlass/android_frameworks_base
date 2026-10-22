@@ -133,6 +133,7 @@ class ServerThread {
         BatteryService battery = null;
         VibratorService vibrator = null;
         AlarmManagerService alarm = null;
+        GlassIdleController glassIdle = null;
         MountService mountService = null;
         NetworkManagementService networkManagement = null;
         NetworkStatsService networkStats = null;
@@ -298,6 +299,15 @@ class ServerThread {
             Slog.i(TAG, "Alarm Manager");
             alarm = new AlarmManagerService(context);
             ServiceManager.addService(Context.ALARM_SERVICE, alarm);
+
+            // OpenMyGlass: Glass device idle; does nothing unless config_glassIdleEnabled.
+            try {
+                Slog.i(TAG, "Glass Idle Controller");
+                glassIdle = new GlassIdleController(context, alarm, power);
+                ServiceManager.addService(GlassIdleController.SERVICE_NAME, glassIdle);
+            } catch (Throwable e) {
+                reportWtf("starting Glass Idle Controller", e);
+            }
 
             Slog.i(TAG, "Init Watchdog");
             Watchdog.getInstance().init(context, battery, power, alarm,
@@ -929,6 +939,7 @@ class ServerThread {
         final TelephonyRegistry telephonyRegistryF = telephonyRegistry;
         final PrintManagerService printManagerF = printManager;
         final MediaRouterService mediaRouterF = mediaRouter;
+        final GlassIdleController glassIdleF = glassIdle;
 
         // We now tell the activity manager it is okay to run third party
         // code.  It will call back into us once it has gotten to the state
@@ -1001,6 +1012,11 @@ class ServerThread {
                     if (recognitionF != null) recognitionF.systemReady();
                 } catch (Throwable e) {
                     reportWtf("making Recognition Service ready", e);
+                }
+                try {
+                    if (glassIdleF != null) glassIdleF.systemReady();
+                } catch (Throwable e) {
+                    reportWtf("making Glass Idle Controller ready", e);
                 }
                 Watchdog.getInstance().start();
 
