@@ -42,7 +42,6 @@ import android.os.SystemClock;
 import android.os.SystemProperties;
 import android.os.UserHandle;
 import android.util.Slog;
-import android.util.SparseBooleanArray;
 import android.util.SparseIntArray;
 import android.util.TimeUtils;
 
@@ -69,14 +68,18 @@ import java.util.List;
  *   report, the inactive timeout is the long one.  Significant motion, when the
  *   sensor HAL has that sensor, leaves idle as in 6.0.
  * - Exempt: system uids (below FIRST_APPLICATION_UID), packages in
- *   config_glassIdleWhitelist, and apps with a process in the foreground, visible or
- *   running a foreground service (the exemption of 6.0's power manager, which uses
+ *   config_glassIdleWhitelist, and apps with a process that is visible or runs a
+ *   foreground service (the exemption of 6.0's power manager, which uses
  *   the uid process state, d23e0d6901935588f9472bd7073fea0009581e9b).  The
- *   exemption covers alarms and wake locks.  4.4 has no TOP_SLEEPING state: the top
- *   activity's process stays at foreground importance while the screen is off, so
- *   with the screen off a process counts as foreground only if it is not just
- *   showing the top activity.  A top app that also runs a foreground service is
- *   then not exempt either (4.4 reports one importance per process).
+ *   exemption covers alarms and wake locks.  With the screen off (the only time
+ *   Glass idles), foreground importance does not count: 4.4 has no TOP_SLEEPING
+ *   state, so the top activity's process stays at foreground importance, and 4.4 also
+ *   reports foreground importance for a process that is running a broadcast receiver
+ *   or service code, or that a foreground client is bound to, which 6.0 does not
+ *   exempt.  Visible and perceptible (a foreground service) count.  A process that
+ *   runs a foreground service but is at foreground importance for one of those
+ *   reasons is not exempt until it drops back (4.4 reports one importance per
+ *   process).
  * - No network, sync or job restrictions, no new public API.
  *
  * Turned on by config_glassIdleEnabled; persist.glass.idle=0 turns it off at run
@@ -117,11 +120,9 @@ public final class GlassIdleController extends Binder {
     private boolean mAppliedIdle;
     private int[] mWhitelistAppIds = new int[0];
     private int[] mExemptAppIds = new int[0];
-    // Per pid: uid, importance and whether it has foreground activities, for the
-    // processes the activity manager reports.
+    // Per pid: uid and importance, for the processes the activity manager reports.
     private final SparseIntArray mProcUids = new SparseIntArray();
     private final SparseIntArray mProcImportance = new SparseIntArray();
-    private final SparseBooleanArray mProcFgActivities = new SparseBooleanArray();
     private boolean mExemptUpdatePending;
     private AlarmManager mAlarmManager;
     private PendingIntent mStepIntent;
@@ -197,8 +198,6 @@ public final class GlassIdleController extends Binder {
                     for (ActivityManager.RunningAppProcessInfo proc : procs) {
                         mProcUids.put(proc.pid, proc.uid);
                         mProcImportance.put(proc.pid, proc.importance);
-                        mProcFgActivities.put(proc.pid, proc.importance
-                                == ActivityManager.RunningAppProcessInfo.IMPORTANCE_FOREGROUND);
                     }
                 }
             }
@@ -241,7 +240,7 @@ public final class GlassIdleController extends Binder {
                 }
                 if (Intent.ACTION_SCREEN_ON.equals(action)
                         || Intent.ACTION_SCREEN_OFF.equals(action)) {
-                    // Whether top activities count as foreground depends on the screen.
+                    // Whether foreground importance counts depends on the screen.
                     scheduleExemptUpdateLocked();
                 }
                 updateLocked();
@@ -266,9 +265,8 @@ public final class GlassIdleController extends Binder {
                 @Override
                 public void run() {
                     synchronized (GlassIdleController.this) {
+                        // Only the importance matters (isExemptProcessLocked).
                         mProcUids.put(pid, uid);
-                        mProcFgActivities.put(pid, foreground);
-                        scheduleExemptUpdateLocked();
                     }
                 }
             });
@@ -296,7 +294,6 @@ public final class GlassIdleController extends Binder {
                     synchronized (GlassIdleController.this) {
                         mProcUids.delete(pid);
                         mProcImportance.delete(pid);
-                        mProcFgActivities.delete(pid);
                         scheduleExemptUpdateLocked();
                     }
                 }
@@ -327,17 +324,17 @@ public final class GlassIdleController extends Binder {
 
     /**
      * Foreground, visible or a foreground service (perceptible): 6.0 keeps these apps'
-     * wake locks.  With the screen off, a process that is at foreground importance
-     * because it shows the top activity does not count (4.4 has no TOP_SLEEPING).
+     * wake locks.  With the screen off, foreground importance does not count: in 4.4 it
+     * also means the top activity behind the off screen (no TOP_SLEEPING), a running
+     * broadcast receiver or service, or a binding from a foreground client.
      */
     private boolean isExemptProcessLocked(int index) {
-        final int pid = mProcImportance.keyAt(index);
         final int importance = mProcImportance.valueAt(index);
         if (importance > ActivityManager.RunningAppProcessInfo.IMPORTANCE_VISIBLE) {
             return false;
         }
-        if (!mScreenOn && importance == ActivityManager.RunningAppProcessInfo.IMPORTANCE_FOREGROUND
-                && mProcFgActivities.get(pid, false)) {
+        if (!mScreenOn
+                && importance <= ActivityManager.RunningAppProcessInfo.IMPORTANCE_FOREGROUND) {
             return false;
         }
         return true;
