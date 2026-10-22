@@ -1312,4 +1312,15 @@
          1 - The device DOES have a permanent menu key; ignore autodetection.
          2 - The device DOES NOT have a permanent menu key; ignore autodetection. -->
     <integer name="config_overrideHasPermanentMenuKey">0</integer>
+
+    <!-- OpenMyGlass: Glass device idle (services/java/com/android/server/
+         GlassIdleController.java), a small Doze from Android 6.0 for when Glass is off
+         the head: while idle, alarms and partial wake locks of apps that are not exempt
+         wait for a maintenance window.  Off by default; a device overlay turns it on. -->
+    <bool name="config_glassIdleEnabled">false</bool>
+
+    <!-- OpenMyGlass: packages whose alarms and wake locks are kept during Glass device
+         idle, besides system uids and apps in the foreground. -->
+    <string-array name="config_glassIdleWhitelist" translatable="false">
+    </string-array>
 </resources>
