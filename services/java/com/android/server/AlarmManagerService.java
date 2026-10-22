@@ -765,6 +765,14 @@ class AlarmManagerService extends IAlarmManager.Stub {
         }
         synchronized (mLock) {
             removeLocked(operation);
+            // OpenMyGlass: an alarm the app cancels is not delivered later from the
+            // delayed non-wakeup list either.  Only here, not in removeLocked(), which
+            // also runs when a repeating alarm is rescheduled or alarms are rebatched.
+            for (int i = mPendingNonWakeupAlarms.size() - 1; i >= 0; i--) {
+                if (mPendingNonWakeupAlarms.get(i).operation.equals(operation)) {
+                    mPendingNonWakeupAlarms.remove(i);
+                }
+            }
         }
     }
     
@@ -775,13 +783,6 @@ class AlarmManagerService extends IAlarmManager.Stub {
             didRemove |= b.remove(operation);
             if (b.size() == 0) {
                 mAlarmBatches.remove(i);
-            }
-        }
-        // OpenMyGlass: a cancelled alarm that was delayed while the screen is off is
-        // not delivered later.
-        for (int i = mPendingNonWakeupAlarms.size() - 1; i >= 0; i--) {
-            if (mPendingNonWakeupAlarms.get(i).operation.equals(operation)) {
-                mPendingNonWakeupAlarms.remove(i);
             }
         }
 
