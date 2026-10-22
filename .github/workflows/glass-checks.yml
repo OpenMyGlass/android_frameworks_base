@@ -21,6 +21,10 @@ jobs:
           persist-credentials: false
           filter: blob:none
           fetch-depth: 0
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "8"
       - name: The public API is unchanged (apps that target API 19 or lower keep working)
         run: git diff --exit-code --stat "$BASE_COMMIT" HEAD -- api/
       - name: Host tests (plain Java, no Android classes)
@@ -33,7 +37,9 @@ jobs:
             out=$RUNNER_TEMP/classes; rm -rf "$out"; mkdir -p "$out"
             # Each test lists the sources it needs in a "// sources:" line.
             srcs=$(sed -n 's|^// sources: ||p' "$t")
-            javac -Xlint:all -Werror -d "$out" $srcs "$t"
+            # 4.4 builds with JDK 6: compile as Java 6 (-Xlint:-options hides the
+            # obsolete-source warning of JDK 8).
+            javac -source 1.6 -target 1.6 -Xlint:all -Xlint:-options -Werror -d "$out" $srcs "$t"
             pkg=$(sed -n 's/^package \(.*\);$/\1/p' "$t")
             java -ea -cp "$out" "$pkg.$(basename "$t" .java)"
           done

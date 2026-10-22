@@ -777,6 +777,13 @@ class AlarmManagerService extends IAlarmManager.Stub {
                 mAlarmBatches.remove(i);
             }
         }
+        // OpenMyGlass: a cancelled alarm that was delayed while the screen is off is
+        // not delivered later.
+        for (int i = mPendingNonWakeupAlarms.size() - 1; i >= 0; i--) {
+            if (mPendingNonWakeupAlarms.get(i).operation.equals(operation)) {
+                mPendingNonWakeupAlarms.remove(i);
+            }
+        }
 
         if (didRemove) {
             if (DEBUG_BATCH) {
@@ -796,6 +803,11 @@ class AlarmManagerService extends IAlarmManager.Stub {
                 mAlarmBatches.remove(i);
             }
         }
+        for (int i = mPendingNonWakeupAlarms.size() - 1; i >= 0; i--) {
+            if (mPendingNonWakeupAlarms.get(i).operation.getTargetPackage().equals(packageName)) {
+                mPendingNonWakeupAlarms.remove(i);
+            }
+        }
 
         if (didRemove) {
             if (DEBUG_BATCH) {
@@ -813,6 +825,12 @@ class AlarmManagerService extends IAlarmManager.Stub {
             didRemove |= b.remove(userHandle);
             if (b.size() == 0) {
                 mAlarmBatches.remove(i);
+            }
+        }
+        for (int i = mPendingNonWakeupAlarms.size() - 1; i >= 0; i--) {
+            if (UserHandle.getUserId(mPendingNonWakeupAlarms.get(i).operation.getCreatorUid())
+                    == userHandle) {
+                mPendingNonWakeupAlarms.remove(i);
             }
         }
 
@@ -918,7 +936,7 @@ class AlarmManagerService extends IAlarmManager.Stub {
                 TimeUtils.formatDuration(nowELAPSED - mLastAlarmDeliveryTime, pw);
                 pw.println();
                 pw.print("Next non-wakeup delivery time: ");
-                TimeUtils.formatDuration(nowELAPSED - mNextNonWakeupDeliveryTime, pw);
+                TimeUtils.formatDuration(mNextNonWakeupDeliveryTime - nowELAPSED, pw);
                 pw.println();
             }
 
@@ -1274,10 +1292,13 @@ class AlarmManagerService extends IAlarmManager.Stub {
         if (mLastAlarmDeliveryTime <= 0) {
             return false;
         }
-        if (mPendingNonWakeupAlarms.size() > 0 && mNextNonWakeupDeliveryTime < nowELAPSED) {
+        if (mPendingNonWakeupAlarms.size() > 0 && mNextNonWakeupDeliveryTime <= nowELAPSED) {
             // This is just a little paranoia, if somehow we have pending non-wakeup alarms
             // and the next delivery time is in the past, then just deliver them all.  This
             // avoids bugs where we get stuck in a loop trying to poll for alarms.
+            // (OpenMyGlass: "<=", so an alarm that fires exactly at the delivery time,
+            // after the allowed delay has grown, delivers instead of waiting again with
+            // no kernel alarm armed.)
             return false;
         }
         long timeSinceLast = nowELAPSED - mLastAlarmDeliveryTime;
