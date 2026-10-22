@@ -34,6 +34,7 @@ jobs:
             # Each test lists the sources it needs in a "// sources:" line.
             srcs=$(sed -n 's|^// sources: ||p' "$t")
             javac -Xlint:all -Werror -d "$out" $srcs "$t"
-            java -ea -cp "$out" "$(basename "$t" .java)"
+            pkg=$(sed -n 's/^package \(.*\);$/\1/p' "$t")
+            java -ea -cp "$out" "$pkg.$(basename "$t" .java)"
           done
           [ "$found" = 1 ] || echo "no host tests yet"
