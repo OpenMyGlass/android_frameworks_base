@@ -1608,6 +1608,9 @@
   <java-symbol type="style" name="Theme.Toast" />
   <java-symbol type="xml" name="storage_list" />
   <java-symbol type="bool" name="config_dreamsSupported" />
+  <!-- OpenMyGlass: Glass device idle -->
+  <java-symbol type="bool" name="config_glassIdleEnabled" />
+  <java-symbol type="array" name="config_glassIdleWhitelist" />
   <java-symbol type="bool" name="config_dreamsEnabledByDefault" />
   <java-symbol type="bool" name="config_dreamsActivatedOnDockByDefault" />
   <java-symbol type="bool" name="config_dreamsActivatedOnSleepByDefault" />
