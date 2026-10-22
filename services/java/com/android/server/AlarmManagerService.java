@@ -855,8 +855,11 @@ class AlarmManagerService extends IAlarmManager.Stub {
                     if (mMaxDelayTime < thisDelayTime) {
                         mMaxDelayTime = thisDelayTime;
                     }
-                    deliverAlarmsLocked(mPendingNonWakeupAlarms, nowELAPSED);
+                    // Deliver from a copy: a cancelled PendingIntent makes deliverAlarmsLocked
+                    // call remove(), which also drops entries from mPendingNonWakeupAlarms.
+                    final ArrayList<Alarm> pending = new ArrayList<Alarm>(mPendingNonWakeupAlarms);
                     mPendingNonWakeupAlarms.clear();
+                    deliverAlarmsLocked(pending, nowELAPSED);
                 }
                 if (mNonInteractiveStartTime > 0) {
                     long dur = nowELAPSED - mNonInteractiveStartTime;
