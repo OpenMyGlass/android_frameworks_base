@@ -65,6 +65,7 @@ import android.view.WindowManagerPolicy;
 import java.io.FileDescriptor;
 import java.io.PrintWriter;
 import java.util.ArrayList;
+import java.util.Arrays;
 
 import libcore.util.Objects;
 
@@ -265,6 +266,12 @@ public final class PowerManagerService extends IPowerManager.Stub
 
     // True if boot completed occurred.  We keep the screen on until this happens.
     private boolean mBootCompleted;
+
+    // True if we are currently in device idle mode.
+    private boolean mDeviceIdleMode;
+
+    // Set of app ids that we will always respect the wake locks for.
+    int[] mDeviceIdleWhitelist = new int[0];
 
     // True if the device is plugged into a power source.
     private boolean mIsPowered;
@@ -631,6 +638,7 @@ public final class PowerManagerService extends IPowerManager.Stub
                     // Update existing wake lock.  This shouldn't happen but is harmless.
                     notifyWakeLockReleasedLocked(wakeLock);
                     wakeLock.updateProperties(flags, tag, packageName, ws, uid, pid);
+                    setWakeLockDisabledStateLocked(wakeLock);
                     notifyWakeLockAcquiredLocked(wakeLock);
                 }
             } else {
@@ -640,6 +648,7 @@ public final class PowerManagerService extends IPowerManager.Stub
                 } catch (RemoteException ex) {
                     throw new IllegalArgumentException("Wake lock is already dead.");
                 }
+                setWakeLockDisabledStateLocked(wakeLock);
                 notifyWakeLockAcquiredLocked(wakeLock);
                 mWakeLocks.add(wakeLock);
             }
@@ -819,7 +828,7 @@ public final class PowerManagerService extends IPowerManager.Stub
     }
 
     private void notifyWakeLockAcquiredLocked(WakeLock wakeLock) {
-        if (mSystemReady) {
+        if (mSystemReady && !wakeLock.mDisabled) {
             wakeLock.mNotifiedAcquired = true;
             mNotifier.onWakeLockAcquired(wakeLock.mFlags, wakeLock.mTag, wakeLock.mPackageName,
                     wakeLock.mOwnerUid, wakeLock.mOwnerPid, wakeLock.mWorkSource);
@@ -1303,7 +1312,10 @@ public final class PowerManagerService extends IPowerManager.Stub
                 final WakeLock wakeLock = mWakeLocks.get(i);
                 switch (wakeLock.mFlags & PowerManager.WAKE_LOCK_LEVEL_MASK) {
                     case PowerManager.PARTIAL_WAKE_LOCK:
-                        mWakeLockSummary |= WAKE_LOCK_CPU;
+                        if (!wakeLock.mDisabled) {
+                            // We only respect this if the wake lock is not disabled.
+                            mWakeLockSummary |= WAKE_LOCK_CPU;
+                        }
                         break;
                     case PowerManager.FULL_WAKE_LOCK:
                         if (mWakefulness != WAKEFULNESS_ASLEEP) {
@@ -2043,6 +2055,77 @@ public final class PowerManagerService extends IPowerManager.Stub
         }
     }
 
+    /**
+     * Device idle mode: partial wake locks of app uids that are not in the
+     * whitelist are ignored.  Called from system_server only (OpenMyGlass: public
+     * because 4.4 has no PowerManagerInternal; the caller is the Glass idle
+     * controller in com.android.server).
+     */
+    public void setDeviceIdleModeInternal(boolean enabled) {
+        synchronized (mLock) {
+            if (mDeviceIdleMode != enabled) {
+                mDeviceIdleMode = enabled;
+                updateWakeLockDisabledStatesLocked();
+            }
+        }
+    }
+
+    /** Sorted app ids whose wake locks are kept in device idle mode. */
+    public void setDeviceIdleWhitelistInternal(int[] appids) {
+        synchronized (mLock) {
+            mDeviceIdleWhitelist = appids;
+            if (mDeviceIdleMode) {
+                updateWakeLockDisabledStatesLocked();
+            }
+        }
+    }
+
+    private void updateWakeLockDisabledStatesLocked() {
+        boolean changed = false;
+        final int numWakeLocks = mWakeLocks.size();
+        for (int i = 0; i < numWakeLocks; i++) {
+            final WakeLock wakeLock = mWakeLocks.get(i);
+            if ((wakeLock.mFlags & PowerManager.WAKE_LOCK_LEVEL_MASK)
+                    == PowerManager.PARTIAL_WAKE_LOCK) {
+                if (setWakeLockDisabledStateLocked(wakeLock)) {
+                    changed = true;
+                    if (wakeLock.mDisabled) {
+                        // This wake lock is no longer being respected.
+                        notifyWakeLockReleasedLocked(wakeLock);
+                    } else {
+                        notifyWakeLockAcquiredLocked(wakeLock);
+                    }
+                }
+            }
+        }
+        if (changed) {
+            mDirty |= DIRTY_WAKE_LOCKS;
+            updatePowerStateLocked();
+        }
+    }
+
+    private boolean setWakeLockDisabledStateLocked(WakeLock wakeLock) {
+        boolean disabled = false;
+        if ((wakeLock.mFlags & PowerManager.WAKE_LOCK_LEVEL_MASK)
+                == PowerManager.PARTIAL_WAKE_LOCK) {
+            if (mDeviceIdleMode) {
+                final int appid = UserHandle.getAppId(wakeLock.mOwnerUid);
+                // If we are in idle mode, we will ignore all partial wake locks that are
+                // for application uids that are not whitelisted.
+                if (appid >= Process.FIRST_APPLICATION_UID &&
+                        Arrays.binarySearch(mDeviceIdleWhitelist, appid) < 0) {
+                    disabled = true;
+                }
+            }
+        }
+        // OpenMyGlass: also clear the flag when an updated lock is no longer partial.
+        if (wakeLock.mDisabled != disabled) {
+            wakeLock.mDisabled = disabled;
+            return true;
+        }
+        return false;
+    }
+
     private boolean isMaximumScreenOffTimeoutFromDeviceAdminEnforcedLocked() {
         return mMaximumScreenOffTimeoutFromDeviceAdmin >= 0
                 && mMaximumScreenOffTimeoutFromDeviceAdmin < Integer.MAX_VALUE;
@@ -2292,6 +2375,8 @@ public final class PowerManagerService extends IPowerManager.Stub
             pw.println("  mProximityPositive=" + mProximityPositive);
             pw.println("  mBootCompleted=" + mBootCompleted);
             pw.println("  mSystemReady=" + mSystemReady);
+            pw.println("  mDeviceIdleMode=" + mDeviceIdleMode);
+            pw.println("  mDeviceIdleWhitelist=" + Arrays.toString(mDeviceIdleWhitelist));
             pw.println("  mWakeLockSummary=0x" + Integer.toHexString(mWakeLockSummary));
             pw.println("  mUserActivitySummary=0x" + Integer.toHexString(mUserActivitySummary));
             pw.println("  mRequestWaitForNegativeProximity=" + mRequestWaitForNegativeProximity);
@@ -2514,6 +2599,7 @@ public final class PowerManagerService extends IPowerManager.Stub
         public final int mOwnerUid;
         public final int mOwnerPid;
         public boolean mNotifiedAcquired;
+        public boolean mDisabled;
 
         public WakeLock(IBinder lock, int flags, String tag, String packageName,
                 WorkSource workSource, int ownerUid, int ownerPid) {
@@ -2570,7 +2656,7 @@ public final class PowerManagerService extends IPowerManager.Stub
         @Override
         public String toString() {
             return getLockLevelString()
-                    + " '" + mTag + "'" + getLockFlagsString()
+                    + " '" + mTag + "'" + getLockFlagsString() + (mDisabled ? " DISABLED" : "")
                     + " (uid=" + mOwnerUid + ", pid=" + mOwnerPid + ", ws=" + mWorkSource + ")";
         }
 
